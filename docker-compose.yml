@@ -1,0 +1,9 @@
+services:
+  archive-main-worker-rmq:
+    image: rjyspl/archive-main-worker-rmq:latest
+    container_name: archive-main-worker-rmq
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - /var/log/archive-main-worker:/app/logs
