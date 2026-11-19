@@ -26,7 +26,7 @@ import (
 	"github.com/Yukthi-Systems/Archive-Main-Worker-RMQ/internal/model"
 	"github.com/Yukthi-Systems/Archive-Main-Worker-RMQ/pkg/logger"
 	"github.com/google/uuid"
-	amqp "github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // processResult carries the outcome of processing a single delivery

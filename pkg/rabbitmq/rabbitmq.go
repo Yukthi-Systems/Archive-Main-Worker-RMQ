@@ -13,122 +13,138 @@
 // version 3 along with this program. If not, see
 // <https://www.gnu.org/licenses/>.
 
-// Package rabbitmq is a thin wrapper around [github.com/streadway/amqp]
-// that exposes only the queue-declare, consume, and publish operations the
-// archive consumer needs, with a single channel per connection.
+// Package rabbitmq is a thin wrapper around [github.com/wagslane/go-rabbitmq]
+// for connecting to RabbitMQ with automatic reconnect, declaring queues,
+// consuming messages, and publishing to the dead-letter queue.
 package rabbitmq
 
 import (
 	"context"
 	"fmt"
+	"time"
 
-	"github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
+	gorabbitmq "github.com/wagslane/go-rabbitmq"
 )
 
-// Connection wraps a single AMQP connection and its one channel. It is not
-// safe for concurrent publishing/consuming from multiple goroutines beyond
-// what the underlying amqp.Channel itself guarantees.
+// Connection wraps a reconnecting [gorabbitmq.Conn], shared between the
+// consumer created via [Connection.NewConsumer] and a [gorabbitmq.Publisher]
+// used to dead-letter failed messages. Create one with [NewConnection]; call
+// [Connection.Close] when done.
 type Connection struct {
-	conn *amqp.Connection
-	ch   *amqp.Channel
+	URL       string
+	conn      *gorabbitmq.Conn
+	publisher *gorabbitmq.Publisher
 }
 
-// NewConnection dials the RabbitMQ broker at url, opens a channel, and
-// applies the given prefetch (QoS) limit. url is a standard AMQP URI, e.g.
-// "amqp://user:pass@host:port/vhost".
-func NewConnection(url string, prefetch int) (*Connection, error) {
-	conn, err := amqp.Dial(url)
+// NewConnection dials the given AMQP URL through go-rabbitmq. The returned
+// connection reconnects automatically on connection loss, waiting
+// reconnectDelay between attempts; consumers and publishers created from it
+// recover their channels and subscriptions transparently. A
+// [gorabbitmq.Publisher] used by [Connection.PublishHeaders] is opened on
+// the same connection.
+//
+// The initial dial is not retried here; callers that want to wait for the
+// broker to come up should retry NewConnection themselves.
+func NewConnection(amqpURL string, reconnectDelay time.Duration) (*Connection, error) {
+	conn, err := gorabbitmq.NewConn(
+		amqpURL,
+		gorabbitmq.WithConnectionOptionsLogger(rmqLogger{}),
+		gorabbitmq.WithConnectionOptionsBaseReconnectInterval(reconnectDelay),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	ch, err := conn.Channel()
+	publisher, err := gorabbitmq.NewPublisher(
+		conn,
+		gorabbitmq.WithPublisherOptionsLogger(rmqLogger{}),
+	)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 
-	if err := ch.Qos(prefetch, 0, false); err != nil {
-		return nil, err
-	}
-
-	return &Connection{conn: conn, ch: ch}, nil
+	return &Connection{URL: amqpURL, conn: conn, publisher: publisher}, nil
 }
 
 // DeclareQueues ensures each named queue exists, declaring it as durable
 // if it isn't already present. Existing queues are left untouched (checked
 // via a passive declare first) so this is safe to call on every startup.
+//
+// Declaration happens over a short-lived, non-reconnecting connection:
+// the consumer is created with [gorabbitmq.WithConsumerOptionsQueueNoDeclare]
+// and nothing consumes from the dead-letter queue, so there is no other
+// place for these queues to be declared.
 func (c *Connection) DeclareQueues(queues ...string) error {
+	rawConn, err := amqp.Dial(c.URL)
+	if err != nil {
+		return fmt.Errorf("dial for queue declaration: %w", err)
+	}
+	defer rawConn.Close()
+
 	for _, q := range queues {
-		_, err := c.ch.QueueDeclarePassive(q, true, false, false, false, nil)
+		// A failed passive declare closes the channel it was issued on, so
+		// each probe runs on its own channel.
+		probeCh, err := rawConn.Channel()
+		if err != nil {
+			return fmt.Errorf("open channel for queue %s check: %w", q, err)
+		}
+		_, err = probeCh.QueueDeclarePassive(q, true, false, false, false, nil)
+		_ = probeCh.Close()
 		if err == nil {
 			continue
 		}
 
-		if _, err := c.ch.QueueDeclare(
-			q, true, false, false, false, nil,
-		); err != nil {
+		ch, err := rawConn.Channel()
+		if err != nil {
+			return fmt.Errorf("open channel for queue %s declaration: %w", q, err)
+		}
+		_, err = ch.QueueDeclare(q, true, false, false, false, nil)
+		_ = ch.Close()
+		if err != nil {
 			return fmt.Errorf("declare queue %s: %w", q, err)
 		}
 	}
 	return nil
 }
 
-// Consume starts delivering messages from queue, identifying this
-// consumer with the given tag. Deliveries are not auto-acknowledged;
-// callers must Ack/Nack each amqp.Delivery themselves.
-func (c *Connection) Consume(queue, consumer string) (<-chan amqp.Delivery, error) {
-	return c.ch.Consume(queue, consumer, false, false, false, false, nil)
-}
-
-// Publish sends body to queue as a persistent, JSON-content-typed message,
-// aborting early if ctx is already done.
-func (c *Connection) Publish(ctx context.Context, queue string, body []byte) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	return c.ch.Publish(
-		"",
+// NewConsumer creates a [gorabbitmq.Consumer] on queue, using consumerTag
+// as the AMQP consumer identifier, concurrency goroutines to run the
+// handler in parallel, and prefetch as the channel's QoS prefetch count.
+// The queue is assumed to already exist (see [Connection.DeclareQueues]) and
+// is not redeclared. Deliveries are not auto-acknowledged; the handler's
+// returned [gorabbitmq.Action] decides Ack/Nack.
+func (c *Connection) NewConsumer(queue, consumerTag string, concurrency, prefetch int) (*gorabbitmq.Consumer, error) {
+	return gorabbitmq.NewConsumer(
+		c.conn,
 		queue,
-		false,
-		false,
-		amqp.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp.Persistent,
-			Body:         body,
-		},
+		gorabbitmq.WithConsumerOptionsConsumerName(consumerTag),
+		gorabbitmq.WithConsumerOptionsConcurrency(concurrency),
+		gorabbitmq.WithConsumerOptionsQOSPrefetch(prefetch),
+		gorabbitmq.WithConsumerOptionsQueueNoDeclare,
+		gorabbitmq.WithConsumerOptionsLogger(rmqLogger{}),
 	)
 }
 
-// PublishHeaders behaves like Publish but attaches the given headers,
-// e.g. dead-letter diagnostic fields such as "x-dead-letter-reason".
+// PublishHeaders sends body to queue on the default exchange as a
+// persistent, JSON-content-typed message with the given headers, e.g.
+// dead-letter diagnostic fields such as "x-dead-letter-reason".
 func (c *Connection) PublishHeaders(ctx context.Context, queue string, body []byte, headers amqp.Table) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	return c.ch.Publish(
-		"",
-		queue,
-		false,
-		false,
-		amqp.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp.Persistent,
-			Body:         body,
-			Headers:      headers,
-		},
+	return c.publisher.PublishWithContext(
+		ctx,
+		body,
+		[]string{queue},
+		gorabbitmq.WithPublishOptionsContentType("application/json"),
+		gorabbitmq.WithPublishOptionsPersistentDelivery,
+		gorabbitmq.WithPublishOptionsHeaders(gorabbitmq.Table(headers)),
 	)
 }
 
-// Close closes the channel and connection, ignoring any errors from an
-// already-closed underlying connection.
+// Close gracefully shuts down the publisher and the underlying connection.
 func (c *Connection) Close() {
-	if c.ch != nil {
-		_ = c.ch.Close()
+	if c.publisher != nil {
+		c.publisher.Close()
 	}
 	if c.conn != nil {
 		_ = c.conn.Close()

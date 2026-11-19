@@ -73,10 +73,34 @@ func main() {
 		config.Cfg.RabbitVHost,
 	)
 	// logger.Debug().Msg("Connection to :" + rabbitURL)
-	conn, err := rabbitmq.NewConnection(rabbitURL, config.Cfg.RabbitPrefetch)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Failed to connect to RabbitMQ broker")
+
+	// Listen for termination signals before connecting so the retry loop
+	// below can be interrupted.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	// Retry the initial connection until the broker is reachable. Once
+	// connected, go-rabbitmq reconnects automatically on connection loss
+	// using the same delay.
+	var conn *rabbitmq.Connection
+	for {
+		conn, err = rabbitmq.NewConnection(rabbitURL, config.Cfg.AMQPReconnectDelay)
+		if err == nil {
+			break
+		}
+		logger.Error().
+			Err(err).
+			Dur("retry_in", config.Cfg.AMQPReconnectDelay).
+			Msg("Failed to connect to RabbitMQ broker; retrying")
+
+		select {
+		case <-sig:
+			logger.Info().Msg("Shutdown signal received before RabbitMQ connection was established")
+			return
+		case <-time.After(config.Cfg.AMQPReconnectDelay):
+		}
 	}
+	logger.Info().Msg("Connected to RabbitMQ broker successfully")
 	defer conn.Close()
 
 	cons := consumer.NewConsumer(conn, chDB, apiClient)
@@ -85,11 +109,8 @@ func main() {
 	}
 
 	// Wait for termination signal
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
 	logger.Info().Msg("Shutting down email archive worker...")
 	cons.Stop()
-	time.Sleep(1 * time.Second)
 }

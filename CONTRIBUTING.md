@@ -7,7 +7,7 @@ conventions used in this codebase, and how to submit a change.
 ## Getting Started
 
 1. Fork the repository and clone your fork.
-2. Install [Go 1.25+](https://go.dev/dl/).
+2. Install [Go 1.26+](https://go.dev/dl/).
 3. Copy the environment template and adjust it for your local RabbitMQ/ClickHouse instances:
    ```bash
    cp .env.example .env

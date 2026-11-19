@@ -1,13 +1,14 @@
 module github.com/Yukthi-Systems/Archive-Main-Worker-RMQ
 
-go 1.25.3
+go 1.26.0
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.47.0
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
+	github.com/rabbitmq/amqp091-go v1.12.0
 	github.com/rs/zerolog v1.35.1
-	github.com/streadway/amqp v1.1.0
+	github.com/wagslane/go-rabbitmq v0.16.1
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
